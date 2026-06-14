@@ -3,6 +3,8 @@ const GEOAPIFY_API_KEY = "4127fb8b9c3e418b8693ea38fdb4578b";
 const MAX_DELAY_MINUTES = 60;
 const MAX_DELAY_MS = MAX_DELAY_MINUTES * 60 * 1000;
 
+const BATCH_SIZE = 10;
+
 /* INPUTS */
 const ideInput = document.getElementById("ideInput");
 const dataFirstInput = document.getElementById("dataFirstInput");
@@ -11,6 +13,9 @@ const processBtn = document.getElementById("processBtn");
 
 /* GLOBAL POI STORAGE */
 let POIS = [];
+
+/* GEOCODE CACHE */
+const geocodeCache = {};
 
 /* =========================================
    POINT IN POLYGON
@@ -61,29 +66,62 @@ function parseDate(dateRaw) {
 }
 
 /* =========================================
-   REVERSE GEOCODING
+   REVERSE GEOCODING (with cache)
 ========================================= */
 async function reverseGeocode(lat, lon) {
+  // Round to ~1km precision to maximise cache hits
+  const key = `${lat.toFixed(2)},${lon.toFixed(2)}`;
+
+  if (geocodeCache[key] !== undefined) {
+    return geocodeCache[key];
+  }
+
   try {
     const response = await fetch(
       `https://api.geoapify.com/v1/geocode/reverse?lat=${lat}&lon=${lon}&lang=fr&apiKey=${GEOAPIFY_API_KEY}`
     );
 
     const json = await response.json();
-
     const props = json?.features?.[0]?.properties;
 
-    return (
+    const city =
       props?.city ||
       props?.county ||
       props?.state ||
       props?.formatted ||
-      null
-    );
+      null;
+
+    geocodeCache[key] = city;
+    return city;
   } catch (error) {
     console.error("Reverse geocoding error:", error);
+    geocodeCache[key] = null; // cache the failure too to avoid retrying
     return null;
   }
+}
+
+/* =========================================
+   PRE-FILTER — drop GPS-off vehicles early
+========================================= */
+function isGPSActive(f) {
+  const longitude = Number(f.position?.LON ?? f.longitude);
+  const latitude = Number(f.position?.LAT ?? f.latitude);
+
+  // Drop invalid coordinates
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    return false;
+  }
+
+  // Drop stale GPS
+  const dateRaw = f.position?.date ?? f.date_dernier_signal;
+  const parsedDate = parseDate(dateRaw);
+
+  if (parsedDate) {
+    const diffMs = Date.now() - parsedDate.getTime();
+    if (diffMs > MAX_DELAY_MS) return false;
+  }
+
+  return true;
 }
 
 /* =========================================
@@ -107,62 +145,28 @@ async function processVehicle(f) {
 
   const dateRaw = f.position?.date ?? f.date_dernier_signal;
 
-  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+  const matchedPOI = POIS.find(
+    (poi) => Array.isArray(poi.points) && isPointInPolygon(latitude, longitude, poi.points)
+  );
+
+  if (matchedPOI) {
+    const location = [matchedPOI.name, matchedPOI.commune, matchedPOI.wilaya]
+      .filter(Boolean)
+      .join(", ");
+
     return {
       Matricule: matricule,
       Agence: agence,
       Longitude: longitude,
       Latitude: latitude,
       Dernier_Date: dateRaw ?? null,
-      Location: null,
-      GPS_Status: "Coordonnées GPS invalides",
+      Location: location,
+      GPS_Status: "GPS actif (dans POI)",
     };
   }
 
-  const parsedDate = parseDate(dateRaw);
-
-  let gpsStatus = "GPS actif";
-  let location = null;
-
-  if (parsedDate) {
-    const diffMs = Date.now() - parsedDate.getTime();
-
-    if (diffMs > MAX_DELAY_MS) {
-      return {
-        Matricule: matricule,
-        Agence: agence,
-        Longitude: longitude,
-        Latitude: latitude,
-        Dernier_Date: dateRaw,
-        Location: null,
-        GPS_Status: `GPS non actualisé depuis ${dateRaw}`,
-      };
-    }
-  }
-
-  const matchedPOI = POIS.find((poi) =>
-  Array.isArray(poi.points) &&
-  isPointInPolygon(latitude, longitude, poi.points)
-);
-
-
-  if (matchedPOI) {
-    gpsStatus = "GPS actif (dans POI)";
-
-    location = [
-      matchedPOI.name,
-      matchedPOI.commune,
-      matchedPOI.wilaya,
-    ]
-      .filter(Boolean)
-      .join(", ");
-  } else {
-    gpsStatus = "GPS actif (hors POI)";
-
-    const city = await reverseGeocode(latitude, longitude);
-
-    location = city;
-  }
+  // Outside POI — reverse geocode (cached)
+  const city = await reverseGeocode(latitude, longitude);
 
   return {
     Matricule: matricule,
@@ -170,9 +174,37 @@ async function processVehicle(f) {
     Longitude: longitude,
     Latitude: latitude,
     Dernier_Date: dateRaw ?? null,
-    Location: location,
-    GPS_Status: gpsStatus,
+    Location: city,
+    GPS_Status: "GPS actif (hors POI)",
   };
+}
+
+/* =========================================
+   BATCH RUNNER
+========================================= */
+async function processBatched(fleet) {
+  const results = [];
+
+  for (let i = 0; i < fleet.length; i += BATCH_SIZE) {
+    const batch = fleet.slice(i, i + BATCH_SIZE);
+
+    const batchResults = await Promise.all(
+      batch.map((f) =>
+        processVehicle(f).catch((err) => {
+          console.error("Error processing vehicle:", err);
+          return null;
+        })
+      )
+    );
+
+    results.push(...batchResults.filter(Boolean));
+
+    // Progress feedback
+    const processed = Math.min(i + BATCH_SIZE, fleet.length);
+    processBtn.textContent = `Processing... (${processed}/${fleet.length})`;
+  }
+
+  return results;
 }
 
 /* =========================================
@@ -205,33 +237,28 @@ processBtn.addEventListener("click", async () => {
     }
 
     processBtn.disabled = true;
-    processBtn.textContent = "Processing...";
 
-   const fleetGPS = [];
+    // Filter out GPS-off vehicles before any processing
+    const activeFleet = fleet.filter(isGPSActive);
+    const skipped = fleet.length - activeFleet.length;
 
-for (const f of fleet) {
-  try {
-    const result = await processVehicle(f);
-    fleetGPS.push(result);
-  } catch (err) {
-    console.error("Error processing vehicle:", err);
-  }
-}
-``
+    console.log(`Fleet: ${fleet.length} total, ${activeFleet.length} active, ${skipped} skipped (GPS off/stale)`);
+
+    processBtn.textContent = `Processing... (0/${activeFleet.length})`;
+
+    // Clear cache between runs
+    Object.keys(geocodeCache).forEach((k) => delete geocodeCache[k]);
+
+    const fleetGPS = await processBatched(activeFleet);
 
     const worksheet = XLSX.utils.json_to_sheet(fleetGPS);
     const workbook = XLSX.utils.book_new();
 
-    XLSX.utils.book_append_sheet(
-      workbook,
-      worksheet,
-      "FleetGPS"
-    );
-
+    XLSX.utils.book_append_sheet(workbook, worksheet, "FleetGPS");
     XLSX.writeFile(workbook, "fleetGPS.xlsx");
-    console.log("FINAL RESULT:", fleetGPS);
 
-    alert("Excel exported successfully.");
+    console.log("FINAL RESULT:", fleetGPS);
+    alert(`Excel exported successfully.\n✅ ${fleetGPS.length} vehicles exported.\n⏭️ ${skipped} skipped (GPS off or stale).`);
   } catch (error) {
     console.error(error);
     alert("An error occurred while processing files.");
